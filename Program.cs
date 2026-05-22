@@ -20,6 +20,7 @@ builder.Services.Configure<Microsoft.AspNetCore.Http.Features.FormOptions>(optio
     options.MultipartBodyLengthLimit = 100 * 1024 * 1024; // 100 ла
 });
 builder.Services.AddDbContext<AppDbContext>();
+
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowAll", policy =>
@@ -373,6 +374,7 @@ public class ChatHub : Hub
         foreach (var chat in chats)
         {
             string displayName = chat.Name;
+            string otherUsername = null;
 
             if (!chat.IsGroup)
             {
@@ -385,7 +387,10 @@ public class ChatHub : Hub
                     .FirstOrDefaultAsync();
 
                 if (otherUser != null)
+                {
                     displayName = otherUser.Nickname ?? otherUser.Username;
+                    otherUsername = otherUser.Username;
+                }
             }
 
             var lastMessage = await _db.Messages
@@ -397,6 +402,7 @@ public class ChatHub : Hub
             {
                 Id = chat.RoomId,
                 Name = displayName,
+                OtherUsername = otherUsername,
                 IsGroup = chat.IsGroup,
                 LastMessageTime = lastMessage?.SentAt ?? DateTime.MinValue
             });
