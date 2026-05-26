@@ -363,3 +363,5 @@ MigrationBackup/
 FodyWeavers.xsd
 /Files/general
 /chat.db
+/appsettings.json
+/Files/private_1_2
