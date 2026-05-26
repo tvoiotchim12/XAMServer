@@ -63,7 +63,7 @@ public class FileAttachment
     public string FileName { get; set; }
     public string ContentType { get; set; }
     public long FileSize { get; set; }
-    public string FilePath { get; set; }  // Путь к файлу на диске
+    public string FilePath { get; set; }  
     public string RoomId { get; set; }
     public int SenderId { get; set; }
     public DateTime SentAt { get; set; } = DateTime.UtcNow;
@@ -101,7 +101,6 @@ public class AppDbContext : DbContext
     {
         base.OnModelCreating(modelBuilder);
 
-        // Уникальный индекс на Username
         modelBuilder.Entity<User>()
             .HasIndex(u => u.Username)
             .IsUnique();

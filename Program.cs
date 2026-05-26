@@ -7,19 +7,56 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.IdentityModel.Tokens;
+using Microsoft.AspNetCore.Authorization;
 
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddSignalR(options =>
 {
-    options.MaximumReceiveMessageSize = 100 * 1024 * 1024; // 100 МБ
+    options.MaximumReceiveMessageSize = 100 * 1024 * 1024;
     options.EnableDetailedErrors = true;
 });
 builder.Services.Configure<Microsoft.AspNetCore.Http.Features.FormOptions>(options =>
 {
-    options.MultipartBodyLengthLimit = 100 * 1024 * 1024; // 100 МБ
+    options.MultipartBodyLengthLimit = 100 * 1024 * 1024;
 });
 builder.Services.AddDbContext<AppDbContext>();
+
+builder.Services.AddControllers();
+
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowAll", policy =>
+        policy.AllowAnyMethod().AllowAnyHeader().SetIsOriginAllowed(origin => true));
+});
+
+builder.Services.AddAuthentication(Microsoft.AspNetCore.Authentication.JwtBearer.JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(o =>
+    {
+        o.TokenValidationParameters = new Microsoft.IdentityModel.Tokens.TokenValidationParameters
+        {
+            ValidateIssuer = false,
+            ValidateAudience = false,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new Microsoft.IdentityModel.Tokens.SymmetricSecurityKey(
+                System.Text.Encoding.UTF8.GetBytes(builder.Configuration["Jwt:Secret"]))
+        };
+
+        o.Events = new Microsoft.AspNetCore.Authentication.JwtBearer.JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                var accessToken = context.Request.Query["access_token"];
+                if (!string.IsNullOrEmpty(accessToken) && context.HttpContext.Request.Path.StartsWithSegments("/chathub"))
+                    context.Token = accessToken;
+                return Task.CompletedTask;
+            }
+        };
+    });
+builder.Services.AddAuthorization();
 
 builder.Services.AddCors(options =>
 {
@@ -36,9 +73,11 @@ builder.WebHost.UseKestrel(options =>
 });
 var app = builder.Build();
 app.UseCors("AllowAll");
+app.UseAuthentication();
+app.UseAuthorization();
+app.MapControllers();
 app.MapHub<ChatHub>("/chathub");
 
-// Создаём бд при запуске
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -48,6 +87,7 @@ using (var scope = app.Services.CreateScope())
 app.Run("https://localhost:5001");
 
 // ХАБ SIGNALR
+[Authorize]
 public class ChatHub : Hub
 {
     private readonly AppDbContext _db;
@@ -108,7 +148,6 @@ public class ChatHub : Hub
         await Clients.All.SendAsync("NicknameUpdated", user.Username, newNickname);
     }
 
-    // Сохранить публичный ключ пользователя
     public async Task SetPublicKey(string userName, string publicKey)
     {
         var user = _db.Users.FirstOrDefault(u => u.Username == userName);
@@ -120,7 +159,6 @@ public class ChatHub : Hub
         Console.WriteLine($"SetPublicKey: {userName}, ключ сохранён, длина={user.RSAPublicKey?.Length ?? 0}");
     }
 
-    // Получить публичный ключ пользователя
     public async Task GetPublicKey(string userName)
     {
         Console.WriteLine($"=== GetPublicKey: {userName} ===");
@@ -170,40 +208,36 @@ public class ChatHub : Hub
         await Clients.Caller.SendAsync("AvatarReceived", user.Username, user.AvatarData);
     }
 
-    // ==================== ОТПРАВКА ФАЙЛА ЧАНКАМИ ====================
     public async Task<int> StartFileUpload(string roomId, string userName, string fileName, string contentType, long fileSize, int totalChunks)
-{
-    var user = _db.Users.FirstOrDefault(u => u.Username == userName);
-    if (user == null) return -1;
-
-    var attachment = new FileAttachment
     {
-        FileName = fileName,
-        ContentType = contentType,
-        FileSize = fileSize,
-        FilePath = "",
-        RoomId = roomId,
-        SenderId = user.Id,
-        SentAt = DateTime.UtcNow,
-        TotalChunks = totalChunks
-    };
-    _db.FileAttachments.Add(attachment);
-    await _db.SaveChangesAsync();
+        var user = _db.Users.FirstOrDefault(u => u.Username == userName);
+        if (user == null) return -1;
 
-    return attachment.Id;
-}
+        var attachment = new FileAttachment
+        {
+            FileName = fileName,
+            ContentType = contentType,
+            FileSize = fileSize,
+            FilePath = "",
+            RoomId = roomId,
+            SenderId = user.Id,
+            SentAt = DateTime.UtcNow,
+            TotalChunks = totalChunks
+        };
+        _db.FileAttachments.Add(attachment);
+        await _db.SaveChangesAsync();
+
+        return attachment.Id;
+    }
 
     public async Task UploadFileChunk(int fileId, int chunkIndex, int totalChunks, byte[] encryptedChunk)
     {
-        // Сохраняем чанк на диск временно
         string tempDir = Path.Combine(Directory.GetCurrentDirectory(), "Temp", fileId.ToString());
         if (!Directory.Exists(tempDir))
             Directory.CreateDirectory(tempDir);
 
         string chunkPath = Path.Combine(tempDir, $"{chunkIndex}.chunk");
         await File.WriteAllBytesAsync(chunkPath, encryptedChunk);
-
-        // Если это последний чанк — собираем файл
         if (chunkIndex == totalChunks - 1)
         {
             await AssembleFile(fileId, totalChunks);
@@ -243,7 +277,6 @@ public class ChatHub : Hub
         var user = await _db.Users.FindAsync(attachment.SenderId);
         if (user == null) return;
 
-        // Только ОДНА отправка — через Group (работает для всех, кто в комнате)
         await Clients.Group(attachment.RoomId).SendAsync("ReceiveFileInfo",
             attachment.RoomId, user.Username, attachment.FileName, attachment.ContentType,
             attachment.FileSize, attachment.Id, attachment.SentAt);
@@ -257,8 +290,6 @@ public class ChatHub : Hub
             await Clients.Caller.SendAsync("FileDownloadError", fileId);
             return;
         }
-
-        // Отправляем чанками
         int chunkSize = 256 * 1024;
         long fileLength = new FileInfo(file.FilePath).Length;
         int totalChunks = (int)Math.Ceiling((double)fileLength / chunkSize);
@@ -280,7 +311,6 @@ public class ChatHub : Hub
         }
     }
 
-    // ==================== ПОИСК ПОЛЬЗОВАТЕЛЕЙ ====================
     public async Task SearchUsers(string query)
     {
         Console.WriteLine($"Поиск: '{query}'");
@@ -302,7 +332,6 @@ public class ChatHub : Hub
         await Clients.Caller.SendAsync("SearchResults", users);
     }
 
-    // ==================== СОЗДАНИЕ ПРИВАТНОГО ЧАТА ====================
     public async Task CreatePrivateChat(int targetUserId, string creatorName)
     {
         Console.WriteLine($"=== CreatePrivateChat ===");
@@ -355,7 +384,6 @@ public class ChatHub : Hub
         }
     }
 
-    // ==================== СПИСОК ЧАТОВ ====================
     public async Task GetUserChats(string userName)
     {
         var user = _db.Users.FirstOrDefault(u => u.Username == userName);
@@ -411,29 +439,20 @@ public class ChatHub : Hub
         await Clients.Caller.SendAsync("UserChatsList", result);
     }
 
-    // ==================== РЕГИСТРАЦИЯ ====================
     public async Task Register(string userName, string publicKey = null)
     {
-        var user = _db.Users.FirstOrDefault(u => u.Username == userName);
+        var user = await _db.Users.FirstOrDefaultAsync(u => u.Username == userName);
         if (user == null)
         {
-            user = new User
-            {
-                Username = userName,
-                Nickname = userName,
-                IsOnline = true,
-                LastSeen = DateTime.UtcNow,
-                RSAPublicKey = publicKey  //  Сохраняем сразу
-            };
-            _db.Users.Add(user);
-            await _db.SaveChangesAsync();
+            Context.Abort(); 
+            return;
         }
-        else
+
+        user.IsOnline = true;
+        user.LastSeen = DateTime.UtcNow;
+        if (!string.IsNullOrEmpty(publicKey) && user.RSAPublicKey != publicKey)
         {
-            user.IsOnline = true;
-            user.LastSeen = DateTime.UtcNow;
-            if (!string.IsNullOrEmpty(publicKey))
-                user.RSAPublicKey = publicKey;  //  Обновляем если передан
+            user.RSAPublicKey = publicKey;
             await _db.SaveChangesAsync();
         }
 
@@ -465,7 +484,6 @@ public class ChatHub : Hub
         await _db.SaveChangesAsync();
     }
 
-    // ==================== ОТПРАВКА СООБЩЕНИЯ ====================
     public async Task SendMessageToRoom(string roomId, string userName, string encryptedMessage)
     {
         var user = _db.Users.FirstOrDefault(u => u.Username == userName);
